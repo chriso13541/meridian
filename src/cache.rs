@@ -57,6 +57,7 @@ impl PageCache {
         std::fs::read_to_string(html_path).ok()
     }
 
+    #[allow(dead_code)]
     pub fn get_meta(&self, url: &str) -> Option<CacheMeta> {
         let (_, _, meta_path) = self.paths(url);
         let raw = std::fs::read_to_string(meta_path).ok()?;

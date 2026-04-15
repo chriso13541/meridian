@@ -11,7 +11,6 @@
 use dashmap::DashMap;
 use reqwest::Client;
 use scraper::{Html, Selector};
-use serde::Serialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;

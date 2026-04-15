@@ -54,6 +54,7 @@ impl SearchIndex {
         self.entries.insert(entry.url.clone(), entry);
     }
 
+    #[allow(dead_code)]
     pub fn add_known(&self, url: &str, domain: &str, anchor_text: &str) {
         if self.entries.contains_key(url) {
             if let Some(mut e) = self.entries.get_mut(url) {

@@ -122,7 +122,7 @@ async fn api_search(
 
 /// When a user searches for something, find indexed entries whose title/snippet
 /// match the query and bump their queue priority so they get re-crawled sooner.
-fn boost_queue_for_query(state: &AppState, query: &str) {
+fn boost_queue_for_query(state: &AppState, _query: &str) {
     let candidates = state.index.candidates_for_crawl(200);
     for (url, title, snippet) in candidates {
         let score = state.interests.score(&url, &title, &snippet);
