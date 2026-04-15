@@ -298,10 +298,23 @@ async fn load_seeds() -> Vec<String> {
 ///   - Pushes outbound links back into the queue, scored by the interest graph
 ///   - Sleeps `tick` between batches to stay gentle
 async fn crawl_loop(state: SharedState, tick: Duration, batch_size: usize) {
-    // Seed the queue
+    // Seed the queue.
+    // push_seeds bypasses the visited check so seeds are always re-crawled
+    // on restart — they're the entry points to new content.
     let seeds = load_seeds().await;
-    state.queue.push_many(&seeds, 1.0);
-    info!("crawl loop started — {} urls seeded, tick={:?}, batch={}", seeds.len(), tick, batch_size);
+    state.queue.push_seeds(&seeds);
+    info!("crawl loop started — {} seeds queued, tick={:?}, batch={}", seeds.len(), tick, batch_size);
+
+    // Also prime the queue from existing index entries so the crawler
+    // resumes from where it left off rather than only starting from seeds.
+    let resumable = state.index.candidates_for_crawl(2000);
+    let resume_count = resumable.len();
+    for (url, _, _) in resumable {
+        state.queue.push(&url, 0.8);
+    }
+    if resume_count > 0 {
+        info!("resumed {} index candidates into crawl queue", resume_count);
+    }
 
     let mut ticker = tokio::time::interval(tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

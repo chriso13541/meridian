@@ -53,6 +53,19 @@ impl CrawlQueue {
         }
     }
 
+    /// Force-push a seed URL back into pending even if previously visited.
+    /// Used on startup so seeds are always re-crawled for fresh links,
+    /// regardless of visit history.
+    pub fn push_seed(&self, url: &str) {
+        if !url.starts_with("http") || is_trap(url) { return; }
+        self.visited.remove(url);
+        self.pending.insert(url.to_string(), 1.0);
+    }
+
+    pub fn push_seeds(&self, urls: &[String]) {
+        for url in urls { self.push_seed(url); }
+    }
+
     /// Pop up to `n` highest-priority URLs for crawling.
     /// Marks them as visited so they won't be returned again.
     pub fn pop_batch(&self, n: usize) -> Vec<String> {
