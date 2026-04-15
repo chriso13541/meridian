@@ -252,7 +252,7 @@ async fn background_crawler(state: SharedState, interval: Duration, batch_size: 
 
         let mut scored: Vec<(f32, String)> = candidates
             .into_iter()
-            .map(|(url, title, snippet)| {
+            .map(|(url, title, snippet): (String, String, String)| {
                 let score = state.interests.score(&url, &title, &snippet);
                 (score, url)
             })
