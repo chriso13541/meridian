@@ -92,7 +92,24 @@ async fn api_search(
 
     // Pull a wider set and paginate in Rust (avoids re-querying the index)
     let all = state.index.search(&params.q, offset + PER_PAGE);
-    let results: Vec<search::SearchResult> = all.into_iter().skip(offset).collect();
+    let mut results: Vec<search::SearchResult> = all.into_iter().skip(offset).collect();
+
+    // Cold start: nothing in the index for this query yet.
+    // Crawl seed URLs derived from the query synchronously so the user
+    // gets real results on their first search rather than an empty page.
+    if results.is_empty() {
+        let seeds = build_seed_urls(&params.q);
+        let entries = state.crawler.discover_batch(&seeds).await;
+        for entry in entries {
+            state.index.upsert(entry);
+        }
+        results = state
+            .index
+            .search(&params.q, offset + PER_PAGE)
+            .into_iter()
+            .skip(offset)
+            .collect();
+    }
 
     // Kick off background discovery for stale/unknown URLs in this result set
     let stale_urls: Vec<String> = results
@@ -230,6 +247,23 @@ async fn api_status(State(state): State<SharedState>) -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
+
+/// Build a list of seed URLs for a cold-start crawl.
+/// Uses DuckDuckGo HTML (no JS required, no API key) and a handful of
+/// well-known directories as fallback seeds.
+fn build_seed_urls(query: &str) -> Vec<String> {
+    let encoded = url::form_urlencoded::byte_serialize(query.as_bytes())
+        .collect::<String>();
+
+    vec![
+        // DuckDuckGo HTML search — returns real links without JS
+        format!("https://html.duckduckgo.com/html/?q={}", encoded),
+        // Wikipedia search
+        format!("https://en.wikipedia.org/w/index.php?search={}", encoded),
+        // HackerNews Algolia search API — great for tech queries
+        format!("https://hn.algolia.com/api/v1/search?query={}&tags=story&hitsPerPage=10", encoded),
+    ]
+}
 
 #[tokio::main]
 async fn main() {
