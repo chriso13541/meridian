@@ -413,7 +413,7 @@ async fn main() {
         .route("/api/status",    get(api_status))
         .nest_service("/static", ServeDir::new("static"))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr = "0.0.0.0:3000";
     info!("Meridian listening on http://{}", addr);
