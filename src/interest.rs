@@ -9,7 +9,8 @@
 // interest graph get promoted to the front of the crawl queue.
 
 use dashmap::DashMap;
-use serde::Serialize;
+use tracing::info;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Stopwords we don't want polluting the interest graph with noise.

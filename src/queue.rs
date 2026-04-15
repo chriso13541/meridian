@@ -8,6 +8,8 @@
 // handler both push to the same queue.
 
 use dashmap::DashMap;
+use tracing::info;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 pub struct CrawlQueue {

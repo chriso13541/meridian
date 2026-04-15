@@ -24,11 +24,15 @@ const MERIDIAN_UA: &str =
     "MeridianBot/1.0 (private demand-driven index; +https://generative-systems.net/meridianbot)";
 
 // Maximum simultaneous outgoing HTTP requests across all domains
-const MAX_CONCURRENT: usize = 32;
+// Increased for faster indexing
+const MAX_CONCURRENT: usize = 96;
 
 // Default wait between requests to the same domain if robots.txt
-// doesn't specify one
-const DEFAULT_CRAWL_DELAY_SECS: u64 = 2;
+// doesn't specify one. Reduced for speed.
+const DEFAULT_CRAWL_DELAY_SECS: u64 = 1;
+
+// Never respect a crawl-delay higher than this (prevents one strict site from slowing everything)
+const MAX_CRAWL_DELAY_SECS: u64 = 10;
 
 const FETCH_TIMEOUT_SECS: u64 = 12;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -102,7 +106,9 @@ impl Crawler {
         let allowed = !rules.disallowed.iter()
             .any(|prefix| path.starts_with(prefix.as_str()));
 
-        (allowed, rules.crawl_delay)
+        let delay = rules.crawl_delay.min(MAX_CRAWL_DELAY_SECS);
+
+        (allowed, delay)
     }
 
     async fn fetch_robots(&self, domain: &str) {

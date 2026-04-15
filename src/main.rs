@@ -363,7 +363,7 @@ fn save_all(state: &AppState) {
     tracing::info!("data saved to {}", DATA_DIR);
 }
 
-#[tokio::main(worker_threads = 8)]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -374,6 +374,15 @@ async fn main() {
 
     std::fs::create_dir_all(DATA_DIR).expect("cannot create data dir");
 
+    // Clean up any .tmp files left by a previous crash mid-save
+    for name in ["index.json.tmp", "interests.json.tmp", "visited.json.tmp"] {
+        let p = format!("{}/{}", DATA_DIR, name);
+        if std::path::Path::new(&p).exists() {
+            let _ = std::fs::remove_file(&p);
+            info!("removed stale tmp file: {}", p);
+        }
+    }
+
     info!("loading persisted data…");
     let state: SharedState = Arc::new(AppState {
         index:     search::SearchIndex::load(INDEX_PATH),
@@ -383,12 +392,10 @@ async fn main() {
         queue:     queue::CrawlQueue::load_visited(VISITED_PATH),
     });
 
-    // Start the crawler: 30 second tick, 5 URLs per batch
-    // → roughly 10 pages/min spread across many domains
-    // Increase batch_size or reduce tick once you're happy with it
+    // Crawler: 4s tick, 35 urls/batch → ~400-600+ pages/min
     {
         let s = Arc::clone(&state);
-        tokio::spawn(crawl_loop(s, Duration::from_secs(10), 20));
+        tokio::spawn(crawl_loop(s, Duration::from_secs(4), 35));
     }
 
     // Periodic save every 5 minutes
