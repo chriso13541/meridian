@@ -1,6 +1,7 @@
 mod cache;
 mod crawler;
 mod interest;
+mod queue;
 mod search;
 mod tracker_strip;
 
@@ -15,16 +16,25 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::{cors::CorsLayer, services::ServeDir};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+// ---------------------------------------------------------------------------
+// App state
+// ---------------------------------------------------------------------------
 
 struct AppState {
     index:     search::SearchIndex,
     cache:     cache::PageCache,
     crawler:   crawler::Crawler,
     interests: interest::InterestGraph,
+    queue:     queue::CrawlQueue,
 }
 
 type SharedState = Arc<AppState>;
+
+// ---------------------------------------------------------------------------
+// Request / response types
+// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct SearchParams {
@@ -32,41 +42,44 @@ struct SearchParams {
     #[serde(default = "default_page")]
     page: usize,
 }
-
 fn default_page() -> usize { 1 }
 
 #[derive(Deserialize)]
-struct FetchParams {
-    url: String,
-}
+struct FetchParams { url: String }
 
 #[derive(Serialize)]
 struct SearchResponse {
-    query: String,
-    page: usize,
-    results: Vec<search::SearchResult>,
+    query:         String,
+    page:          usize,
+    results:       Vec<search::SearchResult>,
     total_indexed: usize,
-    total_cached: usize,
-    total_known: usize,
-    elapsed_ms: u128,
-    interests: Vec<interest::InterestEntry>,
+    total_cached:  usize,
+    total_known:   usize,
+    elapsed_ms:    u128,
+    interests:     Vec<interest::InterestEntry>,
 }
 
 #[derive(Serialize)]
 struct StatusResponse {
-    indexed: usize,
-    cached: usize,
-    known: usize,
-    cache_bytes: u64,
-    interest_terms: usize,
+    indexed:          usize,
+    cached:           usize,
+    known:            usize,
+    cache_bytes:      u64,
+    queue_pending:    usize,
+    queue_visited:    usize,
+    interest_terms:   usize,
     interest_domains: usize,
 }
 
 #[derive(Serialize)]
 struct InterestsResponse {
-    terms: Vec<interest::InterestEntry>,
+    terms:   Vec<interest::InterestEntry>,
     domains: Vec<interest::InterestEntry>,
 }
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
 
 async fn root() -> impl IntoResponse {
     match tokio::fs::read_to_string("static/index.html").await {
@@ -82,34 +95,18 @@ async fn api_search(
     let start = std::time::Instant::now();
     state.interests.record_query(&params.q);
 
+    // Boost queue priority for URLs matching this query
+    boost_queue_for_query(&state, &params.q);
+
     const PER_PAGE: usize = 25;
     let offset = (params.page.saturating_sub(1)) * PER_PAGE;
 
-    let all = state.index.search(&params.q, offset + PER_PAGE);
-    let mut results: Vec<search::SearchResult> = all.into_iter().skip(offset).collect();
-
-    if results.is_empty() {
-        let seeds = build_seed_urls(&params.q);
-        let entries = state.crawler.discover_batch(&seeds).await;
-        for entry in entries { state.index.upsert(entry); }
-        results = state.index
-            .search(&params.q, offset + PER_PAGE)
-            .into_iter().skip(offset).collect();
-    }
-
-    let stale_urls: Vec<String> = results
-        .iter()
-        .filter(|r| r.age_secs > 7 * 86400 || r.tier == search::Tier::Known)
-        .map(|r| r.url.clone())
+    let results: Vec<search::SearchResult> = state
+        .index
+        .search(&params.q, offset + PER_PAGE)
+        .into_iter()
+        .skip(offset)
         .collect();
-
-    if !stale_urls.is_empty() {
-        let sc = Arc::clone(&state);
-        tokio::spawn(async move {
-            let entries = sc.crawler.discover_batch(&stale_urls).await;
-            for entry in entries { sc.index.upsert(entry); }
-        });
-    }
 
     Json(SearchResponse {
         query:         params.q,
@@ -123,6 +120,18 @@ async fn api_search(
     })
 }
 
+/// When a user searches for something, find indexed entries whose title/snippet
+/// match the query and bump their queue priority so they get re-crawled sooner.
+fn boost_queue_for_query(state: &AppState, query: &str) {
+    let candidates = state.index.candidates_for_crawl(200);
+    for (url, title, snippet) in candidates {
+        let score = state.interests.score(&url, &title, &snippet);
+        if score > 0.5 {
+            state.queue.push(&url, score + 5.0); // +5 boost for user-triggered
+        }
+    }
+}
+
 async fn api_fetch(
     State(state): State<SharedState>,
     Query(params): Query<FetchParams>,
@@ -130,6 +139,12 @@ async fn api_fetch(
     let url = &params.url;
     let title_hint = state.index.get_title(url).unwrap_or_default();
     state.interests.record_visit(url, &title_hint);
+
+    // Also queue any Known links from this page at elevated priority
+    if let Some(domain) = crawler::Crawler::extract_domain(url) {
+        state.queue.push(url, 3.0); // re-crawl this page sooner
+        drop(domain);
+    }
 
     if state.cache.contains(url) {
         if let Some(html) = state.cache.get_html(url) {
@@ -144,7 +159,7 @@ async fn api_fetch(
     match state.crawler.fetch_and_strip(url).await {
         Some((clean_html, title, _)) => {
             if let Err(e) = state.cache.store(url, &title, &clean_html) {
-                tracing::warn!("cache write failed for {}: {}", url, e);
+                warn!("cache write failed for {}: {}", url, e);
             } else {
                 state.index.mark_cached(url);
             }
@@ -191,12 +206,8 @@ async fn api_index(
         tags:      vec![],
     });
 
-    for link in &report.links {
-        let link_domain = link.parse::<url::Url>().ok()
-            .and_then(|u| u.host_str().map(|h| h.to_string()))
-            .unwrap_or_default();
-        state.index.add_known(link, &link_domain, "");
-    }
+    // Add outbound links to the crawl queue
+    state.queue.push_many(&report.links, 1.0);
 
     (StatusCode::ACCEPTED, "indexed")
 }
@@ -215,69 +226,131 @@ async fn api_status(State(state): State<SharedState>) -> impl IntoResponse {
         cached:           cache_count,
         known:            state.index.known_count(),
         cache_bytes,
+        queue_pending:    state.queue.pending_len(),
+        queue_visited:    state.queue.visited_len(),
         interest_terms:   state.interests.term_count(),
         interest_domains: state.interests.domain_count(),
     })
 }
 
-fn build_seed_urls(query: &str) -> Vec<String> {
-    let encoded = url::form_urlencoded::byte_serialize(query.as_bytes())
-        .collect::<String>();
-    vec![
-        format!("https://html.duckduckgo.com/html/?q={}", encoded),
-        format!("https://en.wikipedia.org/w/index.php?search={}", encoded),
-        format!("https://hn.algolia.com/api/v1/search?query={}&tags=story&hitsPerPage=10", encoded),
-    ]
+// ---------------------------------------------------------------------------
+// Full crawler loop
+// ---------------------------------------------------------------------------
+
+/// Loads seed URLs from seeds.txt (one URL per line, # = comment).
+/// Falls back to a built-in list if the file doesn't exist.
+async fn load_seeds() -> Vec<String> {
+    let from_file: Vec<String> = tokio::fs::read_to_string("seeds.txt").await
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+
+    if !from_file.is_empty() {
+        info!("loaded {} seeds from seeds.txt", from_file.len());
+        return from_file;
+    }
+
+    // Built-in seed list — broad enough to bootstrap a useful index
+    let builtin = vec![
+        // Tech news & aggregators
+        "https://news.ycombinator.com",
+        "https://lobste.rs",
+        "https://thenewstack.io",
+        "https://arstechnica.com",
+
+        // AI / ML
+        "https://www.anthropic.com/news",
+        "https://openai.com/blog",
+        "https://huggingface.co/blog",
+        "https://lilianweng.github.io",
+        "https://simonwillison.net",
+
+        // Dev reference
+        "https://doc.rust-lang.org/book/",
+        "https://developer.mozilla.org/en-US/docs/Web",
+        "https://stackoverflow.com/questions?tab=Votes",
+
+        // Self-hosting / homelab
+        "https://selfhosted.show",
+        "https://www.reddit.com/r/selfhosted/.rss",
+        "https://noted.lol",
+
+        // General reference
+        "https://en.wikipedia.org/wiki/Main_Page",
+        "https://www.w3.org",
+    ];
+
+    info!("no seeds.txt found, using {} built-in seeds", builtin.len());
+    builtin.into_iter().map(|s| s.to_string()).collect()
 }
 
-/// Background crawl loop. Wakes every `interval`, scores all Known/stale
-/// entries against the interest graph, and crawls the top `batch_size`.
-async fn background_crawler(state: SharedState, interval: Duration, batch_size: usize) {
-    let mut ticker = tokio::time::interval(interval);
+/// Main crawl loop. Runs forever:
+///   - Pops `batch_size` URLs from the queue
+///   - Crawls each one (respecting robots.txt + rate limits)
+///   - Indexes the result
+///   - Pushes outbound links back into the queue, scored by the interest graph
+///   - Sleeps `tick` between batches to stay gentle
+async fn crawl_loop(state: SharedState, tick: Duration, batch_size: usize) {
+    // Seed the queue
+    let seeds = load_seeds().await;
+    state.queue.push_many(&seeds, 1.0);
+    info!("crawl loop started — {} urls seeded, tick={:?}, batch={}", seeds.len(), tick, batch_size);
+
+    let mut ticker = tokio::time::interval(tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         ticker.tick().await;
 
-        if state.interests.term_count() == 0 {
-            debug!("background crawler: no interest signal yet, skipping");
+        let batch = state.queue.pop_batch(batch_size);
+
+        if batch.is_empty() {
+            debug!("crawl loop: queue empty, re-seeding from index candidates");
+            // Re-seed from Known entries that haven't been crawled yet
+            let candidates = state.index.candidates_for_crawl(100);
+            for (url, _title, _snippet) in candidates {
+                state.queue.push(&url, 0.5);
+            }
             continue;
         }
 
-        let candidates = state.index.candidates_for_crawl(batch_size * 4);
-        if candidates.is_empty() {
-            debug!("background crawler: no candidates");
-            continue;
+        info!("crawl loop: crawling {} urls (queue: {} pending, {} visited)",
+            batch.len(), state.queue.pending_len(), state.queue.visited_len());
+
+        for url in batch {
+            let Some(result) = state.crawler.crawl_one(&url).await else {
+                continue;
+            };
+
+            // Score outbound links against the interest graph before queuing
+            for link in &result.outbound_links {
+                let score = if state.interests.term_count() > 0 {
+                    // Use the link URL and source page title as scoring signal
+                    state.interests.score(link, &result.entry.title, "")
+                } else {
+                    0.5 // flat score until we have interest data
+                };
+                state.queue.push(link, score);
+            }
+
+            debug!("indexed: {} (+{} links)", url, result.outbound_links.len());
+            state.index.upsert(result.entry);
         }
-
-        let mut scored: Vec<(f32, String)> = candidates
-            .into_iter()
-            .map(|(url, title, snippet): (String, String, String)| {
-                let score = state.interests.score(&url, &title, &snippet);
-                (score, url)
-            })
-            .collect();
-
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(batch_size);
-
-        let urls: Vec<String> = scored.into_iter().map(|(_, u)| u).collect();
-        if urls.is_empty() { continue; }
-
-        info!("background crawler: crawling {} urls", urls.len());
-        let entries = state.crawler.discover_batch(&urls).await;
-        let n = entries.len();
-        for entry in entries { state.index.upsert(entry); }
-        debug!("background crawler: indexed {} pages", n);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("meridian=debug".parse().unwrap()),
+                .add_directive("meridian=info".parse().unwrap()),
         )
         .init();
 
@@ -286,12 +359,15 @@ async fn main() {
         cache:     cache::PageCache::new(),
         crawler:   crawler::Crawler::new(),
         interests: interest::InterestGraph::new(),
+        queue:     queue::CrawlQueue::new(),
     });
 
+    // Start the crawler: 30 second tick, 5 URLs per batch
+    // → roughly 10 pages/min spread across many domains
+    // Increase batch_size or reduce tick once you're happy with it
     {
-        let bg = Arc::clone(&state);
-        tokio::spawn(background_crawler(bg, Duration::from_secs(60), 10));
-        info!("background crawler started (60s interval, 10 urls/cycle)");
+        let s = Arc::clone(&state);
+        tokio::spawn(crawl_loop(s, Duration::from_secs(30), 5));
     }
 
     let app = Router::new()

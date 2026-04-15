@@ -1,0 +1,39 @@
+# Meridian seed URLs — one per line, # for comments
+# The crawler starts here and follows links outward.
+# Add any sites you want to prioritize in your index.
+# Restart meridian after editing.
+
+# Tech news
+https://news.ycombinator.com
+https://lobste.rs
+https://thenewstack.io
+https://arstechnica.com/information-technology/
+
+# AI / ML
+https://www.anthropic.com/news
+https://openai.com/blog
+https://huggingface.co/blog
+https://simonwillison.net
+https://lilianweng.github.io
+
+# Rust
+https://doc.rust-lang.org/book/
+https://blog.rust-lang.org
+https://this-week-in-rust.org
+
+# Dev reference
+https://developer.mozilla.org/en-US/docs/Web
+https://stackoverflow.com/questions?tab=Votes
+
+# Self-hosting / homelab
+https://noted.lol
+https://www.reddit.com/r/selfhosted/.rss
+https://perfectmediaserver.com
+
+# Cars / automotive
+https://www.nicoclub.com/nissan-forums
+https://www.reddit.com/r/cars/.rss
+
+# General reference
+https://en.wikipedia.org/wiki/Portal:Technology
+https://en.wikipedia.org/wiki/Portal:Computing
