@@ -1,5 +1,6 @@
 mod cache;
 mod crawler;
+mod interest;
 mod search;
 mod tracker_strip;
 
@@ -12,24 +13,18 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::{cors::CorsLayer, services::ServeDir};
-use tracing::info;
-
-// ---------------------------------------------------------------------------
-// Shared application state
-// ---------------------------------------------------------------------------
+use tracing::{debug, info};
 
 struct AppState {
-    index: search::SearchIndex,
-    cache: cache::PageCache,
-    crawler: crawler::Crawler,
+    index:     search::SearchIndex,
+    cache:     cache::PageCache,
+    crawler:   crawler::Crawler,
+    interests: interest::InterestGraph,
 }
 
 type SharedState = Arc<AppState>;
-
-// ---------------------------------------------------------------------------
-// Query / response types
-// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct SearchParams {
@@ -54,6 +49,7 @@ struct SearchResponse {
     total_cached: usize,
     total_known: usize,
     elapsed_ms: u128,
+    interests: Vec<interest::InterestEntry>,
 }
 
 #[derive(Serialize)]
@@ -62,13 +58,16 @@ struct StatusResponse {
     cached: usize,
     known: usize,
     cache_bytes: u64,
+    interest_terms: usize,
+    interest_domains: usize,
 }
 
-// ---------------------------------------------------------------------------
-// Route handlers
-// ---------------------------------------------------------------------------
+#[derive(Serialize)]
+struct InterestsResponse {
+    terms: Vec<interest::InterestEntry>,
+    domains: Vec<interest::InterestEntry>,
+}
 
-/// GET / — serve the main HTML frontend
 async fn root() -> impl IntoResponse {
     match tokio::fs::read_to_string("static/index.html").await {
         Ok(html) => Html(html).into_response(),
@@ -76,42 +75,28 @@ async fn root() -> impl IntoResponse {
     }
 }
 
-/// GET /api/search?q=<query>&page=<n>
-/// Returns JSON search results from the in-memory index.
-/// If results are stale (not seen in the last 7 days), a background
-/// rediscovery crawl is triggered for those URLs.
 async fn api_search(
     State(state): State<SharedState>,
     Query(params): Query<SearchParams>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
+    state.interests.record_query(&params.q);
 
-    // Results per page
     const PER_PAGE: usize = 25;
     let offset = (params.page.saturating_sub(1)) * PER_PAGE;
 
-    // Pull a wider set and paginate in Rust (avoids re-querying the index)
     let all = state.index.search(&params.q, offset + PER_PAGE);
     let mut results: Vec<search::SearchResult> = all.into_iter().skip(offset).collect();
 
-    // Cold start: nothing in the index for this query yet.
-    // Crawl seed URLs derived from the query synchronously so the user
-    // gets real results on their first search rather than an empty page.
     if results.is_empty() {
         let seeds = build_seed_urls(&params.q);
         let entries = state.crawler.discover_batch(&seeds).await;
-        for entry in entries {
-            state.index.upsert(entry);
-        }
-        results = state
-            .index
+        for entry in entries { state.index.upsert(entry); }
+        results = state.index
             .search(&params.q, offset + PER_PAGE)
-            .into_iter()
-            .skip(offset)
-            .collect();
+            .into_iter().skip(offset).collect();
     }
 
-    // Kick off background discovery for stale/unknown URLs in this result set
     let stale_urls: Vec<String> = results
         .iter()
         .filter(|r| r.age_secs > 7 * 86400 || r.tier == search::Tier::Known)
@@ -119,44 +104,35 @@ async fn api_search(
         .collect();
 
     if !stale_urls.is_empty() {
-        let state_clone = Arc::clone(&state);
+        let sc = Arc::clone(&state);
         tokio::spawn(async move {
-            let entries = state_clone.crawler.discover_batch(&stale_urls).await;
-            for entry in entries {
-                state_clone.index.upsert(entry);
-            }
+            let entries = sc.crawler.discover_batch(&stale_urls).await;
+            for entry in entries { sc.index.upsert(entry); }
         });
     }
 
-    let elapsed = start.elapsed().as_millis();
-
     Json(SearchResponse {
-        query: params.q,
-        page: params.page,
+        query:         params.q,
+        page:          params.page,
         results,
         total_indexed: state.index.entry_count(),
-        total_cached: state.index.cached_count(),
-        total_known: state.index.known_count(),
-        elapsed_ms: elapsed,
+        total_cached:  state.index.cached_count(),
+        total_known:   state.index.known_count(),
+        elapsed_ms:    start.elapsed().as_millis(),
+        interests:     state.interests.top_terms(8),
     })
 }
 
-/// POST /api/fetch?url=<url>
-/// Triggered when the user clicks a result. Fetches the live page,
-/// strips trackers, caches it, and marks it as Tier::Cached in the index.
-/// Returns the cleaned HTML so the browser can render it immediately
-/// without a second round-trip.
 async fn api_fetch(
     State(state): State<SharedState>,
     Query(params): Query<FetchParams>,
 ) -> impl IntoResponse {
     let url = &params.url;
+    let title_hint = state.index.get_title(url).unwrap_or_default();
+    state.interests.record_visit(url, &title_hint);
 
-    // Serve from cache if fresh enough
     if state.cache.contains(url) {
         if let Some(html) = state.cache.get_html(url) {
-            let meta = state.cache.get_meta(url);
-            let _title = meta.map(|m| m.title).unwrap_or_default();
             return (
                 StatusCode::OK,
                 [("X-Meridian-Cache", "hit"), ("Content-Type", "text/html")],
@@ -165,9 +141,8 @@ async fn api_fetch(
         }
     }
 
-    // Live fetch + strip
     match state.crawler.fetch_and_strip(url).await {
-        Some((clean_html, title, _snippet)) => {
+        Some((clean_html, title, _)) => {
             if let Err(e) = state.cache.store(url, &title, &clean_html) {
                 tracing::warn!("cache write failed for {}: {}", url, e);
             } else {
@@ -187,8 +162,6 @@ async fn api_fetch(
     }
 }
 
-/// POST /api/index  — receive a page report from the browser extension.
-/// Body: { url, title, snippet, links: [string] }
 #[derive(Deserialize)]
 struct ExtensionReport {
     url: String,
@@ -201,30 +174,25 @@ async fn api_index(
     State(state): State<SharedState>,
     Json(report): Json<ExtensionReport>,
 ) -> impl IntoResponse {
-    let domain = report.url
-        .parse::<url::Url>()
-        .ok()
+    state.interests.record_visit(&report.url, &report.title);
+
+    let domain = report.url.parse::<url::Url>().ok()
         .and_then(|u| u.host_str().map(|h| h.to_string()))
         .unwrap_or_default();
 
-    // The visited page itself becomes a Tier::Cached entry
-    // (user has literally viewed it — it's in their browser cache)
     state.index.upsert(search::IndexEntry {
-        url: report.url.clone(),
+        url:       report.url.clone(),
         domain,
-        title: report.title,
-        snippet: report.snippet,
-        tier: search::Tier::Cached,
+        title:     report.title,
+        snippet:   report.snippet,
+        tier:      search::Tier::Cached,
         last_seen: chrono::Utc::now(),
-        score: 1.5,
-        tags: vec![],
+        score:     1.5,
+        tags:      vec![],
     });
 
-    // All outbound links become Tier::Known seeds
     for link in &report.links {
-        let link_domain = link
-            .parse::<url::Url>()
-            .ok()
+        let link_domain = link.parse::<url::Url>().ok()
             .and_then(|u| u.host_str().map(|h| h.to_string()))
             .unwrap_or_default();
         state.index.add_known(link, &link_domain, "");
@@ -233,36 +201,75 @@ async fn api_index(
     (StatusCode::ACCEPTED, "indexed")
 }
 
-/// GET /api/status
-async fn api_status(State(state): State<SharedState>) -> impl IntoResponse {
-    let (cache_count, cache_bytes) = state.cache.stats();
-    Json(StatusResponse {
-        indexed: state.index.entry_count(),
-        cached: cache_count,
-        known: state.index.known_count(),
-        cache_bytes,
+async fn api_interests(State(state): State<SharedState>) -> impl IntoResponse {
+    Json(InterestsResponse {
+        terms:   state.interests.top_terms(10),
+        domains: state.interests.top_domains(8),
     })
 }
 
-// ---------------------------------------------------------------------------
-// Startup
-// ---------------------------------------------------------------------------
+async fn api_status(State(state): State<SharedState>) -> impl IntoResponse {
+    let (cache_count, cache_bytes) = state.cache.stats();
+    Json(StatusResponse {
+        indexed:          state.index.entry_count(),
+        cached:           cache_count,
+        known:            state.index.known_count(),
+        cache_bytes,
+        interest_terms:   state.interests.term_count(),
+        interest_domains: state.interests.domain_count(),
+    })
+}
 
-/// Build a list of seed URLs for a cold-start crawl.
-/// Uses DuckDuckGo HTML (no JS required, no API key) and a handful of
-/// well-known directories as fallback seeds.
 fn build_seed_urls(query: &str) -> Vec<String> {
     let encoded = url::form_urlencoded::byte_serialize(query.as_bytes())
         .collect::<String>();
-
     vec![
-        // DuckDuckGo HTML search — returns real links without JS
         format!("https://html.duckduckgo.com/html/?q={}", encoded),
-        // Wikipedia search
         format!("https://en.wikipedia.org/w/index.php?search={}", encoded),
-        // HackerNews Algolia search API — great for tech queries
         format!("https://hn.algolia.com/api/v1/search?query={}&tags=story&hitsPerPage=10", encoded),
     ]
+}
+
+/// Background crawl loop. Wakes every `interval`, scores all Known/stale
+/// entries against the interest graph, and crawls the top `batch_size`.
+async fn background_crawler(state: SharedState, interval: Duration, batch_size: usize) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+
+        if state.interests.term_count() == 0 {
+            debug!("background crawler: no interest signal yet, skipping");
+            continue;
+        }
+
+        let candidates = state.index.candidates_for_crawl(batch_size * 4);
+        if candidates.is_empty() {
+            debug!("background crawler: no candidates");
+            continue;
+        }
+
+        let mut scored: Vec<(f32, String)> = candidates
+            .into_iter()
+            .map(|(url, title, snippet)| {
+                let score = state.interests.score(&url, &title, &snippet);
+                (score, url)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(batch_size);
+
+        let urls: Vec<String> = scored.into_iter().map(|(_, u)| u).collect();
+        if urls.is_empty() { continue; }
+
+        info!("background crawler: crawling {} urls", urls.len());
+        let entries = state.crawler.discover_batch(&urls).await;
+        let n = entries.len();
+        for entry in entries { state.index.upsert(entry); }
+        debug!("background crawler: indexed {} pages", n);
+    }
 }
 
 #[tokio::main]
@@ -275,26 +282,31 @@ async fn main() {
         .init();
 
     let state: SharedState = Arc::new(AppState {
-        index: search::SearchIndex::new(),
-        cache: cache::PageCache::new(),
-        crawler: crawler::Crawler::new(),
+        index:     search::SearchIndex::new(),
+        cache:     cache::PageCache::new(),
+        crawler:   crawler::Crawler::new(),
+        interests: interest::InterestGraph::new(),
     });
 
+    {
+        let bg = Arc::clone(&state);
+        tokio::spawn(background_crawler(bg, Duration::from_secs(60), 10));
+        info!("background crawler started (60s interval, 10 urls/cycle)");
+    }
+
     let app = Router::new()
-        .route("/", get(root))
-        .route("/api/search", get(api_search))
-        .route("/api/fetch", post(api_fetch))
-        .route("/api/index", post(api_index))
-        .route("/api/status", get(api_status))
-        // Serve everything under static/ (CSS, JS, fonts if you add them)
+        .route("/",              get(root))
+        .route("/api/search",    get(api_search))
+        .route("/api/fetch",     post(api_fetch))
+        .route("/api/index",     post(api_index))
+        .route("/api/interests", get(api_interests))
+        .route("/api/status",    get(api_status))
         .nest_service("/static", ServeDir::new("static"))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
     let addr = "0.0.0.0:3000";
     info!("Meridian listening on http://{}", addr);
-    info!("open http://localhost:3000 in your browser");
-
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }

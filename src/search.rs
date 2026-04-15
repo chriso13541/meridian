@@ -188,3 +188,47 @@ impl SearchIndex {
             .count()
     }
 }
+
+    /// Returns the stored title for a URL, if it exists in the index.
+    pub fn get_title(&self, url: &str) -> Option<String> {
+        self.entries.get(url).map(|e| e.title.clone())
+    }
+
+    /// Returns up to `limit` Known or stale Indexed entries as
+    /// (url, title, snippet) tuples for the background crawler to score
+    /// and potentially promote.
+    pub fn candidates_for_crawl(&self, limit: usize) -> Vec<(String, String, String)> {
+        let now = chrono::Utc::now();
+        let mut candidates: Vec<(String, String, String)> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                match e.tier {
+                    Tier::Known => true,
+                    Tier::Indexed => {
+                        // Stale if not seen in 3 days
+                        (now - e.last_seen).num_seconds() > 3 * 86400
+                    }
+                    Tier::Cached => false, // already have a clean copy
+                }
+            })
+            .map(|e| (e.url.clone(), e.title.clone(), e.snippet.clone()))
+            .take(limit)
+            .collect();
+
+        // Shuffle so we don't always process the same URLs
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        candidates.sort_by_key(|(url, _, _)| {
+            let mut h = DefaultHasher::new();
+            url.hash(&mut h);
+            seed.hash(&mut h);
+            h.finish()
+        });
+
+        candidates
+    }
