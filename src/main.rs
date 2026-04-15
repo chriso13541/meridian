@@ -345,7 +345,7 @@ async fn crawl_loop(state: SharedState, tick: Duration, batch_size: usize) {
 // Startup
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
+#[tokio::main(worker_threads = 8)]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -367,7 +367,7 @@ async fn main() {
     // Increase batch_size or reduce tick once you're happy with it
     {
         let s = Arc::clone(&state);
-        tokio::spawn(crawl_loop(s, Duration::from_secs(30), 5));
+        tokio::spawn(crawl_loop(s, Duration::from_secs(10), 20));
     }
 
     let app = Router::new()

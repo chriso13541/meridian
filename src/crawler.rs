@@ -24,11 +24,11 @@ const MERIDIAN_UA: &str =
     "MeridianBot/1.0 (private demand-driven index; +https://generative-systems.net/meridianbot)";
 
 // Maximum simultaneous outgoing HTTP requests across all domains
-const MAX_CONCURRENT: usize = 8;
+const MAX_CONCURRENT: usize = 32;
 
 // Default wait between requests to the same domain if robots.txt
 // doesn't specify one
-const DEFAULT_CRAWL_DELAY_SECS: u64 = 5;
+const DEFAULT_CRAWL_DELAY_SECS: u64 = 2;
 
 const FETCH_TIMEOUT_SECS: u64 = 12;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
