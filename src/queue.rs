@@ -115,3 +115,27 @@ fn is_trap(url: &str) -> bool {
 
     false
 }
+
+// ── Persistence ────────────────────────────────────────────────────────────
+
+impl CrawlQueue {
+    /// Save the visited set so the crawler doesn't re-crawl known URLs after restart.
+    /// The pending queue is not saved — it refills quickly from seeds and the index.
+    pub fn save_visited(&self, path: &str) -> std::io::Result<()> {
+        let visited: Vec<String> = self.visited.iter().map(|e| e.key().clone()).collect();
+        let tmp = format!("{}.tmp", path);
+        std::fs::write(&tmp, serde_json::to_string(&visited)?)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    pub fn load_visited(path: &str) -> Self {
+        let q = Self::new();
+        let Ok(raw) = std::fs::read_to_string(path) else { return q; };
+        let Ok(visited) = serde_json::from_str::<Vec<String>>(&raw) else { return q; };
+        let count = visited.len();
+        for url in visited { q.visited.insert(url, ()); }
+        tracing::info!("loaded {} visited urls from {}", count, path);
+        q
+    }
+}

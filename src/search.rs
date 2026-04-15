@@ -184,3 +184,28 @@ impl SearchIndex {
         self.entries.iter().filter(|e| e.tier == Tier::Known).count()
     }
 }
+
+// ── Persistence ────────────────────────────────────────────────────────────
+
+impl SearchIndex {
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        let entries: Vec<IndexEntry> = self.entries
+            .iter()
+            .map(|e| e.value().clone())
+            .collect();
+        let tmp = format!("{}.tmp", path);
+        std::fs::write(&tmp, serde_json::to_string(&entries)?)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    pub fn load(path: &str) -> Self {
+        let index = Self::new();
+        let Ok(raw) = std::fs::read_to_string(path) else { return index; };
+        let Ok(entries) = serde_json::from_str::<Vec<IndexEntry>>(&raw) else { return index; };
+        let count = entries.len();
+        for entry in entries { index.entries.insert(entry.url.clone(), entry); }
+        tracing::info!("loaded {} index entries from {}", count, path);
+        index
+    }
+}

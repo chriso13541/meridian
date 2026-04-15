@@ -133,3 +133,35 @@ impl InterestGraph {
     pub fn term_count(&self) -> usize { self.terms.len() }
     pub fn domain_count(&self) -> usize { self.domains.len() }
 }
+
+// ── Persistence ────────────────────────────────────────────────────────────
+
+use std::collections::HashMap;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedInterests {
+    terms:   HashMap<String, f32>,
+    domains: HashMap<String, f32>,
+}
+
+impl InterestGraph {
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        let data = SavedInterests {
+            terms:   self.terms.iter().map(|e| (e.key().clone(), *e.value())).collect(),
+            domains: self.domains.iter().map(|e| (e.key().clone(), *e.value())).collect(),
+        };
+        let tmp = format!("{}.tmp", path);
+        std::fs::write(&tmp, serde_json::to_string(&data)?)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    pub fn load(path: &str) -> Self {
+        let graph = Self::new();
+        let Ok(raw) = std::fs::read_to_string(path) else { return graph; };
+        let Ok(data) = serde_json::from_str::<SavedInterests>(&raw) else { return graph; };
+        for (k, v) in data.terms   { graph.terms.insert(k, v); }
+        for (k, v) in data.domains { graph.domains.insert(k, v); }
+        graph
+    }
+}

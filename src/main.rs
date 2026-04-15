@@ -5,6 +5,11 @@ mod queue;
 mod search;
 mod tracker_strip;
 
+const DATA_DIR:       &str = "./data";
+const INDEX_PATH:    &str = "./data/index.json";
+const INTERESTS_PATH:&str = "./data/interests.json";
+const VISITED_PATH:  &str = "./data/visited.json";
+
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -345,6 +350,19 @@ async fn crawl_loop(state: SharedState, tick: Duration, batch_size: usize) {
 // Startup
 // ---------------------------------------------------------------------------
 
+fn save_all(state: &AppState) {
+    if let Err(e) = state.index.save(INDEX_PATH) {
+        tracing::warn!("index save failed: {}", e);
+    }
+    if let Err(e) = state.interests.save(INTERESTS_PATH) {
+        tracing::warn!("interests save failed: {}", e);
+    }
+    if let Err(e) = state.queue.save_visited(VISITED_PATH) {
+        tracing::warn!("visited save failed: {}", e);
+    }
+    tracing::info!("data saved to {}", DATA_DIR);
+}
+
 #[tokio::main(worker_threads = 8)]
 async fn main() {
     tracing_subscriber::fmt()
@@ -354,12 +372,15 @@ async fn main() {
         )
         .init();
 
+    std::fs::create_dir_all(DATA_DIR).expect("cannot create data dir");
+
+    info!("loading persisted data…");
     let state: SharedState = Arc::new(AppState {
-        index:     search::SearchIndex::new(),
+        index:     search::SearchIndex::load(INDEX_PATH),
         cache:     cache::PageCache::new(),
         crawler:   crawler::Crawler::new(),
-        interests: interest::InterestGraph::new(),
-        queue:     queue::CrawlQueue::new(),
+        interests: interest::InterestGraph::load(INTERESTS_PATH),
+        queue:     queue::CrawlQueue::load_visited(VISITED_PATH),
     });
 
     // Start the crawler: 30 second tick, 5 URLs per batch
@@ -368,6 +389,19 @@ async fn main() {
     {
         let s = Arc::clone(&state);
         tokio::spawn(crawl_loop(s, Duration::from_secs(10), 20));
+    }
+
+    // Periodic save every 5 minutes
+    {
+        let s = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(300));
+            ticker.tick().await; // skip first immediate tick
+            loop {
+                ticker.tick().await;
+                save_all(&s);
+            }
+        });
     }
 
     let app = Router::new()
@@ -384,5 +418,15 @@ async fn main() {
     let addr = "0.0.0.0:3000";
     info!("Meridian listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+
+    // Catch Ctrl-C and save before exit
+    let state_shutdown = Arc::clone(&state);
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        info!("shutting down — saving data…");
+        save_all(&state_shutdown);
+        std::process::exit(0);
+    });
+
     axum::serve(listener, app).await.unwrap();
 }
